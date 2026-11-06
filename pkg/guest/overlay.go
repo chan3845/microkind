@@ -55,7 +55,7 @@ func RunOverlayInit() error {
 	}
 
 	logOverlay("Mounting %s to %s...", overlayDev, stagingBacking)
-	if err := unix.Mount(overlayDev, stagingBacking, "ext4", 0, "noatime"); err != nil {
+	if err := unix.Mount(overlayDev, stagingBacking, "ext4", unix.MS_NOATIME, ""); err != nil {
 		return fmt.Errorf("failed to mount %s on %s: %w", overlayDev, stagingBacking, err)
 	}
 
@@ -175,6 +175,15 @@ func ensureExt4(dev string) error {
 }
 
 func switchRoot(newRoot string) error {
+	// 1. Try standard /sbin/switch_root
+	if _, err := os.Stat("/sbin/switch_root"); err == nil {
+		logOverlay("Using /sbin/switch_root %s /sbin/init...", newRoot)
+		env := append(os.Environ(), "container=firecracker", "HOME=/root", "TERM=linux")
+		return syscall.Exec("/sbin/switch_root", []string{"/sbin/switch_root", newRoot, "/sbin/init"}, env)
+	}
+
+	// 2. Fallback to manual switch
+	_ = unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, "")
 	if err := unix.Chdir(newRoot); err != nil {
 		return fmt.Errorf("chdir %s: %w", newRoot, err)
 	}

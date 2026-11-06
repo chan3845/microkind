@@ -196,6 +196,9 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 		if err := cli.WaitForReady(ctx, 15*time.Second); err != nil {
 			return fmt.Errorf("node %s agent not ready: %w", n.Name, err)
 		}
+		// Write /etc/hosts and /etc/resolv.conf so k0s DNS & pre-flight checks pass
+		_ = cli.WriteFile(ctx, "/etc/hosts", []byte(fmt.Sprintf("127.0.0.1 localhost\n::1 localhost\n%s %s\n", n.GuestIP, n.Name)), 0644)
+		_ = cli.WriteFile(ctx, "/etc/resolv.conf", []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0644)
 	}
 
 	// 5. Setup optional host port forward for API server
@@ -211,10 +214,22 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 	fmt.Printf("Initializing Kubernetes control-plane on %s...\n", cpNode.Name)
 	cpCli := vsock.NewClient(cpNode.VsockPath)
 
-	// Single control plane: adaptive kine
-	installCmd := []string{"k0s", "install", "controller", "--single"}
+	hasWorkers := false
+	for _, n := range cfg.Nodes {
+		if n.Role == config.RoleWorker {
+			hasWorkers = true
+			break
+		}
+	}
+
+	installCmd := []string{"k0s", "install", "controller", "--ignore-pre-flight-checks"}
+	if !hasWorkers {
+		installCmd = append(installCmd, "--single")
+	} else {
+		installCmd = append(installCmd, "--enable-worker=false")
+	}
 	if cfg.K0s.Storage.Type == "etcd" {
-		installCmd = []string{"k0s", "install", "controller"}
+		installCmd = []string{"k0s", "install", "controller", "--ignore-pre-flight-checks"}
 	}
 	if resp, err := cpCli.Exec(ctx, installCmd, nil, "", nil); err != nil || resp.ExitCode != 0 {
 		return fmt.Errorf("k0s install controller failed: %v (%s)", err, string(resp.Stderr))
@@ -256,11 +271,19 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 	}
 
 	// 7. Generate Worker Token & Join Workers in Parallel
-	workerTokenResp, err := cpCli.Exec(ctx, []string{"k0s", "token", "create", "--role=worker", "--expiry=2h"}, nil, "", nil)
-	if err != nil || workerTokenResp.ExitCode != 0 {
-		return fmt.Errorf("generate worker token: %v (%s)", err, string(workerTokenResp.Stderr))
+	var workerToken string
+	tokenDeadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(tokenDeadline) {
+		workerTokenResp, err := cpCli.Exec(ctx, []string{"k0s", "token", "create", "--role=worker", "--expiry=2h"}, nil, "", nil)
+		if err == nil && workerTokenResp.ExitCode == 0 && len(workerTokenResp.Stdout) > 0 {
+			workerToken = strings.TrimSpace(string(workerTokenResp.Stdout))
+			break
+		}
+		time.Sleep(2 * time.Second)
 	}
-	workerToken := strings.TrimSpace(string(workerTokenResp.Stdout))
+	if workerToken == "" {
+		return fmt.Errorf("generate worker token timed out waiting for status.sock")
+	}
 
 	for _, n := range state.Nodes {
 		if n.Role != config.RoleWorker {
@@ -273,7 +296,7 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 			return fmt.Errorf("write worker token to %s: %w", n.Name, err)
 		}
 		// Install & start worker
-		joinCmd := []string{"k0s", "install", "worker", "--token-file", "/etc/k0s/worker-token"}
+		joinCmd := []string{"k0s", "install", "worker", "--ignore-pre-flight-checks", "--token-file", "/etc/k0s/worker-token"}
 		if resp, err := wCli.Exec(ctx, joinCmd, nil, "", nil); err != nil || resp.ExitCode != 0 {
 			return fmt.Errorf("k0s install worker on %s failed: %v (%s)", n.Name, err, string(resp.Stderr))
 		}
