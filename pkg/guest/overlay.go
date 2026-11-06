@@ -61,11 +61,15 @@ func RunOverlayInit() error {
 
 	upperDir := filepath.Join(stagingBacking, "upper")
 	workDir := filepath.Join(stagingBacking, "work")
+	containerdDir := filepath.Join(stagingBacking, "containerd")
 	if err := os.MkdirAll(upperDir, 0755); err != nil {
 		return fmt.Errorf("failed to mkdir %s: %w", upperDir, err)
 	}
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		return fmt.Errorf("failed to mkdir %s: %w", workDir, err)
+	}
+	if err := os.MkdirAll(containerdDir, 0755); err != nil {
+		return fmt.Errorf("failed to mkdir %s: %w", containerdDir, err)
 	}
 
 	// 5. Mount overlayfs at /run/newroot
@@ -79,8 +83,9 @@ func RunOverlayInit() error {
 		return fmt.Errorf("failed to mount overlayfs: %w", err)
 	}
 
-	// 6. Move the backing filesystem into newRoot so it remains mounted
-	finalBacking := filepath.Join(newRoot, "run", "overlay_backing")
+	// 6. Move the backing filesystem into newRoot (/mnt/overlay_backing)
+	// Must be on /mnt so OpenRC doesn't shadow it with tmpfs on /run
+	finalBacking := filepath.Join(newRoot, "mnt", "overlay_backing")
 	if err := os.MkdirAll(finalBacking, 0755); err != nil {
 		return fmt.Errorf("failed to mkdir %s: %w", finalBacking, err)
 	}
@@ -88,7 +93,22 @@ func RunOverlayInit() error {
 		return fmt.Errorf("failed to move overlay backing mount: %w", err)
 	}
 
-	// 7. Move virtual filesystems into newRoot
+	// 7. Bind mount containerd storage directly to ext4 backing so containerd gets native ext4
+	// (avoiding Linux kernel "overlayfs: filesystem not supported as upperdir" nested overlay error)
+	containerdExt4 := filepath.Join(finalBacking, "containerd")
+	targetK0sContainerd := filepath.Join(newRoot, "var", "lib", "k0s", "containerd")
+	_ = os.MkdirAll(targetK0sContainerd, 0755)
+	if err := unix.Mount(containerdExt4, targetK0sContainerd, "", unix.MS_BIND, ""); err != nil {
+		logOverlay("Warning: failed to bind mount k0s containerd: %v", err)
+	}
+
+	targetContainerd := filepath.Join(newRoot, "var", "lib", "containerd")
+	_ = os.MkdirAll(targetContainerd, 0755)
+	if err := unix.Mount(containerdExt4, targetContainerd, "", unix.MS_BIND, ""); err != nil {
+		logOverlay("Warning: failed to bind mount containerd: %v", err)
+	}
+
+	// 8. Move virtual filesystems into newRoot
 	for _, dir := range []string{"/dev", "/proc", "/sys"} {
 		target := filepath.Join(newRoot, dir)
 		if err := os.MkdirAll(target, 0755); err != nil {
@@ -99,13 +119,13 @@ func RunOverlayInit() error {
 		}
 	}
 
-	// 8. Pivot/Switch root to newRoot
+	// 9. Pivot/Switch root to newRoot
 	logOverlay("Switching root to overlayfs...")
 	if err := switchRoot(newRoot); err != nil {
 		return fmt.Errorf("failed to switch root: %w", err)
 	}
 
-	// 9. Exec systemd
+	// 10. Exec systemd
 	logOverlay("Executing /sbin/init on merged rootfs...")
 	return execSystemd()
 }

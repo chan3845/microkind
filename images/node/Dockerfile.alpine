@@ -40,11 +40,8 @@ RUN chmod +x /usr/local/bin/k0s
 # Create k0s directory structure
 RUN mkdir -p /var/lib/k0s/images /etc/k0s /var/log
 
-# Download k0s airgap image bundle for offline bootstrap
-ARG AIRGAP=false
-RUN if [ "$AIRGAP" = "true" ] && [ -f "bin/bundle.tar" ]; then \
-    cp bin/bundle.tar /var/lib/k0s/images/bundle.tar ; \
-    fi
+# Copy k0s airgap image bundle for offline bootstrap
+COPY bin/bundle.tar /var/lib/k0s/images/bundle.tar
 
 WORKDIR /root
 CMD ["/sbin/init"]

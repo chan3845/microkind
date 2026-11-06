@@ -222,23 +222,16 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 		}
 	}
 
-	installCmd := []string{"k0s", "install", "controller", "--ignore-pre-flight-checks"}
+	installCmd := []string{"k0s", "install", "controller", "--enable-worker", "--ignore-pre-flight-checks", "--force", "--start"}
 	if !hasWorkers {
-		installCmd = append(installCmd, "--single")
-	} else {
-		installCmd = append(installCmd, "--enable-worker=false")
-	}
-	if cfg.K0s.Storage.Type == "etcd" {
-		installCmd = []string{"k0s", "install", "controller", "--ignore-pre-flight-checks"}
+		installCmd = append(installCmd, "--no-taints")
 	}
 	if resp, err := cpCli.Exec(ctx, installCmd, nil, "", nil); err != nil || resp.ExitCode != 0 {
 		return fmt.Errorf("k0s install controller failed: %v (%s)", err, string(resp.Stderr))
 	}
 
-	if resp, err := cpCli.Exec(ctx, []string{"rc-service", "k0scontroller", "start"}, nil, "", nil); err != nil || resp.ExitCode != 0 {
-		// Fallback to k0s start directly
-		_, _ = cpCli.Exec(ctx, []string{"k0s", "start"}, nil, "", nil)
-	}
+	_, _ = cpCli.Exec(ctx, []string{"rc-service", "k0scontroller", "start"}, nil, "", nil)
+	_, _ = cpCli.Exec(ctx, []string{"k0s", "start"}, nil, "", nil)
 
 	// Poll until k0s is ready
 	fmt.Printf("Waiting for Kubernetes API server to become ready...\n")
@@ -301,6 +294,35 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 			return fmt.Errorf("k0s install worker on %s failed: %v (%s)", n.Name, err, string(resp.Stderr))
 		}
 		_, _ = wCli.Exec(ctx, []string{"rc-service", "k0sworker", "start"}, nil, "", nil)
+		_, _ = wCli.Exec(ctx, []string{"rc-service", "k0s", "start"}, nil, "", nil)
+		_, _ = wCli.Exec(ctx, []string{"k0s", "start"}, nil, "", nil)
+	}
+
+	fmt.Printf("Waiting for all %d nodes to be Ready in Kubernetes...\n", len(state.Nodes))
+	waitNodesDeadline := time.Now().Add(90 * time.Second)
+	allReady := false
+	for time.Now().Before(waitNodesDeadline) {
+		resp, err := cpCli.Exec(ctx, []string{"k0s", "kubectl", "get", "nodes", "--no-headers"}, nil, "", nil)
+		if err == nil && resp.ExitCode == 0 {
+			lines := strings.Split(strings.TrimSpace(string(resp.Stdout)), "\n")
+			readyCount := 0
+			for _, line := range lines {
+				if strings.Contains(line, "Ready") && !strings.Contains(line, "NotReady") {
+					readyCount++
+				}
+			}
+			if readyCount >= len(state.Nodes) {
+				allReady = true
+				break
+			}
+		}
+		time.Sleep(3 * time.Second)
+	}
+
+	if allReady {
+		fmt.Printf("All nodes are Ready!\n")
+	} else {
+		fmt.Printf("Nodes joined, continuing (may still be transitioning to Ready)...\n")
 	}
 
 	fmt.Printf("\nCluster %q created successfully!\n", cfg.Name)

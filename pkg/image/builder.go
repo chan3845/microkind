@@ -121,9 +121,9 @@ func (b *Builder) ExtractRootfs(ctx context.Context, imageTag string, targetDir 
 		}
 	}
 
-	// Allocate sparse rootfs.ext4 (2 GB virtual capacity, occupies minimal actual blocks)
+	// Allocate sparse rootfs.ext4 (4 GB virtual capacity, occupies minimal actual blocks)
 	_ = os.Remove(rootfsPath)
-	if err := exec.Command("truncate", "-s", "2G", rootfsPath).Run(); err != nil {
+	if err := exec.Command("truncate", "-s", "4G", rootfsPath).Run(); err != nil {
 		return fmt.Errorf("create sparse rootfs.ext4: %w", err)
 	}
 
