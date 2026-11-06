@@ -65,6 +65,7 @@ func (b *Builder) BuildNodeImage(ctx context.Context, repoRoot string) error {
 
 	fmt.Printf("[image-builder] Building node image %s...\n", imageTag)
 	buildCmd := exec.CommandContext(ctx, "docker", "build",
+		"--network=host",
 		"-t", imageTag,
 		"-f", dockerfilePath,
 		"--build-arg", airgapArg,
@@ -120,9 +121,9 @@ func (b *Builder) ExtractRootfs(ctx context.Context, imageTag string, targetDir 
 		}
 	}
 
-	// Allocate sparse rootfs.ext4 (500 MB max capacity, occupies minimal actual blocks)
+	// Allocate sparse rootfs.ext4 (2 GB virtual capacity, occupies minimal actual blocks)
 	_ = os.Remove(rootfsPath)
-	if err := exec.Command("truncate", "-s", "500M", rootfsPath).Run(); err != nil {
+	if err := exec.Command("truncate", "-s", "2G", rootfsPath).Run(); err != nil {
 		return fmt.Errorf("create sparse rootfs.ext4: %w", err)
 	}
 

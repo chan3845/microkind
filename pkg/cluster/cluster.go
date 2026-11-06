@@ -84,6 +84,9 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 	if _, err := os.Stat(rootfsPath); os.IsNotExist(err) {
 		fmt.Printf("Base node image not found in cache. Building Alpine+k0s node image...\n")
 		repoRoot := "/home/ubuntu/fckind"
+		if _, err := os.Stat(repoRoot); os.IsNotExist(err) {
+			repoRoot = "/home/chan/fckind"
+		}
 		if err := builder.BuildNodeImage(ctx, repoRoot); err != nil {
 			return fmt.Errorf("build node image: %w", err)
 		}

@@ -1,7 +1,8 @@
 FROM alpine:3.20
 
 # Install required tools for k0s & container runtimes
-RUN apk add --no-cache \
+RUN sed -i 's/https:/http:/g' /etc/apk/repositories \
+    && apk add --no-cache \
     openrc \
     ca-certificates \
     e2fsprogs \
@@ -18,7 +19,7 @@ RUN apk add --no-cache \
 # Configure OpenRC
 RUN sed -i 's/#rc_sys=""/rc_sys="openvz"/' /etc/rc.conf \
     && echo 'rc_provide="loopback net"' >> /etc/rc.conf \
-    && sed -i 's/cgroup_add_service /# cgroup_add_service /g' /lib/rc/sh/openrc-run.sh
+    && find / -name "openrc-run.sh" -exec sed -i 's/cgroup_add_service /# cgroup_add_service /g' {} +
 
 # Copy Firecracker microVM kernel
 COPY bin/vmlinux /boot/vmlinux
@@ -32,18 +33,17 @@ COPY images/node/fckind-agent.openrc /etc/init.d/fckind-agent
 RUN chmod +x /etc/init.d/fckind-agent \
     && rc-update add fckind-agent default
 
-# Download and install k0s binary
-ARG K0S_VERSION=v1.37.2+k0s.0
-RUN curl -fSL "https://github.com/k0sproject/k0s/releases/download/${K0S_VERSION}/k0s-${K0S_VERSION}-amd64" -o /usr/local/bin/k0s \
-    && chmod +x /usr/local/bin/k0s
+# Copy k0s binary
+COPY bin/k0s /usr/local/bin/k0s
+RUN chmod +x /usr/local/bin/k0s
 
 # Create k0s directory structure
 RUN mkdir -p /var/lib/k0s/images /etc/k0s /var/log
 
 # Download k0s airgap image bundle for offline bootstrap
-ARG AIRGAP=true
-RUN if [ "$AIRGAP" = "true" ]; then \
-    curl -fSL "https://github.com/k0sproject/k0s/releases/download/${K0S_VERSION}/k0s-airgap-bundle-${K0S_VERSION}-linux-amd64.tar" -o /var/lib/k0s/images/bundle.tar || true ; \
+ARG AIRGAP=false
+RUN if [ "$AIRGAP" = "true" ] && [ -f "bin/bundle.tar" ]; then \
+    cp bin/bundle.tar /var/lib/k0s/images/bundle.tar ; \
     fi
 
 WORKDIR /root
