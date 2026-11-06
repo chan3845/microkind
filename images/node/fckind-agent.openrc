@@ -1,0 +1,15 @@
+#!/sbin/openrc-run
+
+name="fckind-agent"
+description="fckind Guest vsock Agent"
+command="/usr/local/bin/fckind-agent"
+command_args="--mode=agent"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/fckind-agent.log"
+error_log="/var/log/fckind-agent.log"
+
+depend() {
+    need net
+    after localmount
+}

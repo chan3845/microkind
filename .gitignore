@@ -1,0 +1,13 @@
+# Binaries
+bin/
+*.exe
+
+# Firecracker and runtime sockets/state
+*.sock
+*.ext4
+*.log
+
+# Caches and local dev
+.cache/
+.local/
+tmp/

@@ -1,0 +1,16 @@
+[Unit]
+Description=fckind Guest vsock Agent
+After=network.target containerd.service
+Wants=containerd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fckind-agent --mode=agent
+Restart=always
+RestartSec=1s
+LimitNOFILE=65536
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
