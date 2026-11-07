@@ -1,14 +1,19 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"fckind/pkg/config"
@@ -38,6 +43,7 @@ type NodeState struct {
 	VsockPath   string          `json:"vsock_path"`
 	APISockPath string          `json:"api_sock_path"`
 	StateDir    string          `json:"state_dir"`
+	PID         int             `json:"pid,omitempty"`
 }
 
 // Manager orchestrates cluster lifecycle
@@ -64,13 +70,26 @@ func (m *Manager) ClusterDir(name string) string {
 }
 
 // CreateCluster creates and bootstraps a multi-node Firecracker K8s cluster
-func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) error {
+func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) (err error) {
 	clusterDir := m.ClusterDir(cfg.Name)
 	if _, err := os.Stat(clusterDir); err == nil {
 		return fmt.Errorf("cluster %q already exists (run 'fckind delete cluster --name %s' first)", cfg.Name, cfg.Name)
 	}
 
 	fmt.Printf("Creating cluster %q with %d nodes...\n", cfg.Name, len(cfg.Nodes))
+
+	var (
+		netMgr    *network.NetworkManager
+		instances []*vmm.Instance
+		tapNames  []string
+		success   bool
+	)
+	defer func() {
+		if !success && (netMgr != nil || len(instances) > 0) {
+			fmt.Println("\nCluster creation failed. Rolling back resources...")
+			m.cleanupFailedCluster(cfg.Name, netMgr, instances, tapNames)
+		}
+	}()
 
 	// 1. Verify / prepare cached node image (vmlinux + rootfs.ext4)
 	builder, err := image.NewBuilder(cfg.K0s.Version, true)
@@ -93,7 +112,7 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 	}
 
 	// 2. Setup Host Network (Bridge + NAT)
-	netMgr, err := network.NewNetworkManager(cfg.Name)
+	netMgr, err = network.NewNetworkManager(cfg.Name)
 	if err != nil {
 		return fmt.Errorf("init network manager: %w", err)
 	}
@@ -115,7 +134,6 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 	}
 
 	// 3. Launch MicroVMs in parallel
-	var instances []*vmm.Instance
 	var cpNode *NodeState
 
 	for i, nodeCfg := range cfg.Nodes {
@@ -129,6 +147,7 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 
 		guestIP := netMgr.NodeIP(i)
 		tapName := netMgr.TAPName(i, string(nodeCfg.Role))
+		tapNames = append(tapNames, tapName)
 		if err := netMgr.CreateTAP(tapName); err != nil {
 			return fmt.Errorf("create tap for %s: %w", nodeName, err)
 		}
@@ -175,6 +194,7 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 			VsockPath:   inst.Config.VsockPath,
 			APISockPath: inst.APISock,
 			StateDir:    nodeDir,
+			PID:         inst.PID(),
 		}
 		state.Nodes[nodeName] = nodeState
 
@@ -278,24 +298,48 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 		return fmt.Errorf("generate worker token timed out waiting for status.sock")
 	}
 
+	// Join workers in parallel
+	var workerNodes []NodeState
 	for _, n := range state.Nodes {
-		if n.Role != config.RoleWorker {
-			continue
+		if n.Role == config.RoleWorker {
+			workerNodes = append(workerNodes, n)
 		}
-		fmt.Printf("Joining worker %s to cluster...\n", n.Name)
-		wCli := vsock.NewClient(n.VsockPath)
-		// Write token to guest /etc/k0s/worker-token
-		if err := wCli.WriteFile(ctx, "/etc/k0s/worker-token", []byte(workerToken), 0600); err != nil {
-			return fmt.Errorf("write worker token to %s: %w", n.Name, err)
+	}
+
+	if len(workerNodes) > 0 {
+		var wg sync.WaitGroup
+		errChan := make(chan error, len(workerNodes))
+
+		for _, n := range workerNodes {
+			wg.Add(1)
+			go func(node NodeState) {
+				defer wg.Done()
+				fmt.Printf("Joining worker %s to cluster...\n", node.Name)
+				wCli := vsock.NewClient(node.VsockPath)
+				if err := wCli.WriteFile(ctx, "/etc/k0s/worker-token", []byte(workerToken), 0600); err != nil {
+					errChan <- fmt.Errorf("write worker token to %s: %w", node.Name, err)
+					return
+				}
+				joinCmd := []string{"k0s", "install", "worker", "--ignore-pre-flight-checks", "--token-file", "/etc/k0s/worker-token"}
+				if resp, err := wCli.Exec(ctx, joinCmd, nil, "", nil); err != nil || (resp != nil && resp.ExitCode != 0) {
+					errMsg := ""
+					if resp != nil {
+						errMsg = string(resp.Stderr)
+					}
+					errChan <- fmt.Errorf("k0s install worker on %s failed: %v (%s)", node.Name, err, errMsg)
+					return
+				}
+				_, _ = wCli.Exec(ctx, []string{"rc-service", "k0sworker", "start"}, nil, "", nil)
+				_, _ = wCli.Exec(ctx, []string{"rc-service", "k0s", "start"}, nil, "", nil)
+				_, _ = wCli.Exec(ctx, []string{"k0s", "start"}, nil, "", nil)
+			}(n)
 		}
-		// Install & start worker
-		joinCmd := []string{"k0s", "install", "worker", "--ignore-pre-flight-checks", "--token-file", "/etc/k0s/worker-token"}
-		if resp, err := wCli.Exec(ctx, joinCmd, nil, "", nil); err != nil || resp.ExitCode != 0 {
-			return fmt.Errorf("k0s install worker on %s failed: %v (%s)", n.Name, err, string(resp.Stderr))
+
+		wg.Wait()
+		close(errChan)
+		if err := <-errChan; err != nil {
+			return err
 		}
-		_, _ = wCli.Exec(ctx, []string{"rc-service", "k0sworker", "start"}, nil, "", nil)
-		_, _ = wCli.Exec(ctx, []string{"rc-service", "k0s", "start"}, nil, "", nil)
-		_, _ = wCli.Exec(ctx, []string{"k0s", "start"}, nil, "", nil)
 	}
 
 	fmt.Printf("Waiting for all %d nodes to be Ready in Kubernetes...\n", len(state.Nodes))
@@ -330,26 +374,42 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 	fmt.Printf("  export KUBECONFIG=%s\n", kubeconfigPath)
 	fmt.Printf("  kubectl get nodes -o wide\n")
 
+	success = true
 	return nil
 }
 
 // DeleteCluster tears down all microVMs, cleans up networking, and removes state
 func (m *Manager) DeleteCluster(ctx context.Context, name string) error {
+	clusterDir := m.ClusterDir(name)
 	state, err := m.GetCluster(name)
 	if err != nil {
+		// If state.json is missing but clusterDir exists, attempt best-effort cleanup
+		if _, statErr := os.Stat(clusterDir); statErr == nil {
+			fmt.Printf("State file missing, performing best-effort cleanup for %q...\n", name)
+			m.bestEffortCleanup(ctx, name, clusterDir)
+			return nil
+		}
 		return err
 	}
 
 	fmt.Printf("Deleting cluster %q...\n", name)
 
-	// 1. Kill all Firecracker instances
+	// 1. Kill all Firecracker instances cleanly by PID / socket
 	for _, n := range state.Nodes {
-		_ = exec.Command("pkill", "-f", n.Name).Run()
+		m.terminateNode(ctx, n)
 	}
 
-	// 2. Clean up network
+	// 2. Clean up network & port forward
 	netMgr, err := network.NewNetworkManager(name)
 	if err == nil {
+		if state.Config.Networking.APIServerPort > 0 {
+			for _, n := range state.Nodes {
+				if n.Role == config.RoleControlPlane {
+					netMgr.TeardownPortForward(state.Config.Networking.APIServerPort, n.GuestIP)
+					break
+				}
+			}
+		}
 		var tapNames []string
 		for _, n := range state.Nodes {
 			tapNames = append(tapNames, n.TAPName)
@@ -358,11 +418,104 @@ func (m *Manager) DeleteCluster(ctx context.Context, name string) error {
 	}
 
 	// 3. Remove cluster state dir
-	clusterDir := m.ClusterDir(name)
 	_ = os.RemoveAll(clusterDir)
 
 	fmt.Printf("Cluster %q deleted successfully.\n", name)
 	return nil
+}
+
+func (m *Manager) terminateNode(ctx context.Context, n NodeState) {
+	// 1. Try Firecracker REST API graceful shutdown
+	if n.APISockPath != "" {
+		if _, err := os.Stat(n.APISockPath); err == nil {
+			cli := &http.Client{
+				Transport: &http.Transport{
+					DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+						return (&net.Dialer{}).DialContext(ctx, "unix", n.APISockPath)
+					},
+				},
+				Timeout: 1 * time.Second,
+			}
+			body := bytes.NewReader([]byte(`{"action_type":"SendCtrlAltDel"}`))
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPut, "http://localhost/actions", body)
+			req.Header.Set("Content-Type", "application/json")
+			if resp, err := cli.Do(req); err == nil {
+				resp.Body.Close()
+				deadline := time.Now().Add(1 * time.Second)
+				for time.Now().Before(deadline) {
+					if n.PID > 0 && !isProcessAlive(n.PID) {
+						break
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+			}
+		}
+	}
+
+	// 2. Terminate PID if still alive
+	pid := n.PID
+	if pid == 0 && n.StateDir != "" {
+		if data, err := os.ReadFile(filepath.Join(n.StateDir, "firecracker.pid")); err == nil {
+			pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+		}
+	}
+
+	if pid > 0 && isProcessAlive(pid) {
+		_ = syscall.Kill(pid, syscall.SIGTERM)
+		time.Sleep(200 * time.Millisecond)
+		if isProcessAlive(pid) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+
+	if n.APISockPath != "" {
+		_ = os.Remove(n.APISockPath)
+	}
+	if n.VsockPath != "" {
+		_ = os.Remove(n.VsockPath)
+	}
+}
+
+func isProcessAlive(pid int) bool {
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return process.Signal(syscall.Signal(0)) == nil
+}
+
+func (m *Manager) cleanupFailedCluster(name string, netMgr *network.NetworkManager, instances []*vmm.Instance, tapNames []string) {
+	for _, inst := range instances {
+		inst.Kill()
+	}
+	if netMgr != nil {
+		_ = netMgr.Teardown(tapNames)
+	}
+	_ = os.RemoveAll(m.ClusterDir(name))
+}
+
+func (m *Manager) bestEffortCleanup(ctx context.Context, name string, clusterDir string) {
+	entries, _ := os.ReadDir(clusterDir)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			nodeDir := filepath.Join(clusterDir, entry.Name())
+			if pidData, err := os.ReadFile(filepath.Join(nodeDir, "firecracker.pid")); err == nil {
+				if pid, err := strconv.Atoi(strings.TrimSpace(string(pidData))); err == nil && pid > 0 {
+					_ = syscall.Kill(pid, syscall.SIGKILL)
+				}
+			}
+			_ = os.Remove(filepath.Join(nodeDir, "api.sock"))
+			_ = os.Remove(filepath.Join(nodeDir, "vsock.sock"))
+		}
+	}
+
+	netMgr, err := network.NewNetworkManager(name)
+	if err == nil {
+		_ = netMgr.Teardown(nil)
+	}
+
+	_ = os.RemoveAll(clusterDir)
+	fmt.Printf("Cluster %q cleaned up successfully.\n", name)
 }
 
 // GetCluster loads the cluster state from disk
@@ -404,32 +557,51 @@ func (m *Manager) LoadDockerImage(ctx context.Context, clusterName string, image
 		return err
 	}
 
-	fmt.Printf("Saving docker image %s...\n", imageName)
-	saveCmd := exec.CommandContext(ctx, "docker", "save", imageName)
-	pipe, err := saveCmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("docker save pipe: %w", err)
-	}
-	if err := saveCmd.Start(); err != nil {
-		return fmt.Errorf("start docker save: %w", err)
+	fmt.Printf("Exporting docker image %s...\n", imageName)
+	tmpDir := filepath.Join(os.TempDir(), "microkind-images")
+	_ = os.MkdirAll(tmpDir, 0755)
+	hostTarPath := filepath.Join(tmpDir, fmt.Sprintf("img-%d.tar", time.Now().UnixNano()))
+	defer os.Remove(hostTarPath)
+
+	saveCmd := exec.CommandContext(ctx, "docker", "save", "-o", hostTarPath, imageName)
+	if out, err := saveCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("docker save %s: %w (%s)", imageName, err, string(out))
 	}
 
-	// Read into memory or stream to each node
-	tarBytes, err := io.ReadAll(pipe)
+	fi, err := os.Stat(hostTarPath)
 	if err != nil {
-		return fmt.Errorf("read docker save: %w", err)
+		return fmt.Errorf("stat saved image: %w", err)
 	}
-	if err := saveCmd.Wait(); err != nil {
-		return fmt.Errorf("wait docker save: %w", err)
-	}
+	fmt.Printf("Image exported (%0.1f MB). Streaming to nodes...\n", float64(fi.Size())/(1024*1024))
+
+	const guestTarPath = "/mnt/overlay_backing/tmp/image-import.tar"
 
 	for _, n := range state.Nodes {
-		fmt.Printf("Loading %s into node %s...\n", imageName, n.Name)
+		fmt.Printf("Loading into node %s...\n", n.Name)
 		cli := vsock.NewClient(n.VsockPath)
-		// Import via k0s containerd
-		resp, err := cli.Exec(ctx, []string{"k0s", "ctr", "images", "import", "-"}, nil, "", tarBytes)
-		if err != nil || resp.ExitCode != 0 {
-			return fmt.Errorf("import image into %s: %v (%s)", n.Name, err, string(resp.Stderr))
+
+		f, err := os.Open(hostTarPath)
+		if err != nil {
+			return fmt.Errorf("open host image tar: %w", err)
+		}
+
+		// Stream to guest overlay ext4 storage in 4 MB chunks (zero guest/host RAM pressure)
+		if err := cli.WriteFileChunked(ctx, guestTarPath, f, 0644, 4*1024*1024); err != nil {
+			f.Close()
+			return fmt.Errorf("stream image to %s: %w", n.Name, err)
+		}
+		f.Close()
+
+		// Import directly from ext4 file inside the microVM
+		resp, err := cli.Exec(ctx, []string{"k0s", "ctr", "images", "import", guestTarPath}, nil, "", nil)
+		_ = cli.WriteFile(ctx, guestTarPath, []byte{}, 0644) // truncate
+		_, _ = cli.Exec(ctx, []string{"rm", "-f", guestTarPath}, nil, "", nil)
+
+		if err != nil {
+			return fmt.Errorf("import image into %s failed: %w", n.Name, err)
+		}
+		if resp != nil && resp.ExitCode != 0 {
+			return fmt.Errorf("import image into %s exited %d: %s", n.Name, resp.ExitCode, string(resp.Stderr))
 		}
 	}
 

@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	DefaultClusterName = "fckind"
+	DefaultClusterName = "microkind"
 	DefaultK0sVersion  = "v1.37.2+k0s.0"
 	DefaultImage       = "localhost:5000/fckind/node:v1.37.2-k0s.0"
 	DefaultPodSubnet   = "10.244.0.0/16"
@@ -108,7 +108,7 @@ func DefaultClusterConfig(name string) *ClusterConfig {
 }
 
 // LoadConfig parses a YAML config file or returns defaults if path is empty
-func LoadConfig(path string, clusterName string) (*ClusterConfig, error) {
+func LoadConfig(path string, clusterName string, nameExplicit bool) (*ClusterConfig, error) {
 	if path == "" {
 		cfg := DefaultClusterConfig(clusterName)
 		return cfg, nil
@@ -124,10 +124,14 @@ func LoadConfig(path string, clusterName string) (*ClusterConfig, error) {
 		return nil, fmt.Errorf("parse config yaml: %w", err)
 	}
 
-	if clusterName != "" {
+	if nameExplicit && clusterName != "" {
 		cfg.Name = clusterName
 	} else if cfg.Name == "" {
-		cfg.Name = DefaultClusterName
+		if clusterName != "" {
+			cfg.Name = clusterName
+		} else {
+			cfg.Name = DefaultClusterName
+		}
 	}
 
 	cfg.applyDefaults()

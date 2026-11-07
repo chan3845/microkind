@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"fckind/pkg/cluster"
 	"fckind/pkg/config"
@@ -14,18 +15,20 @@ import (
 )
 
 var (
-	clusterName string
-	configFile  string
-	nodeImage   string
-	k0sVersion  string
-	isSlim      bool
+	clusterName          string
+	configFile           string
+	nodeImage            string
+	k0sVersion           string
+	isSlim               bool
+	exportKubeconfigPath string
 )
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use:   "fckind",
-		Short: "fckind is kind for Firecracker microVMs (powered by Alpine + k0s)",
-		Long:  "A fast, ultra-minimal, kind-compatible Kubernetes cluster orchestrator running upstream k0s inside Firecracker microVMs on Alpine Linux.",
+		Use:     "microkind",
+		Aliases: []string{"fckind"},
+		Short:   "microkind is kind for Firecracker microVMs (powered by Alpine + k0s)",
+		Long:    "A fast, ultra-minimal, kind-compatible Kubernetes cluster orchestrator running upstream k0s inside Firecracker microVMs on Alpine Linux.",
 	}
 
 	rootCmd.PersistentFlags().StringVarP(&clusterName, "name", "n", config.DefaultClusterName, "Cluster name")
@@ -41,7 +44,8 @@ func main() {
 		Short: "Creates a local Kubernetes cluster inside Firecracker microVMs",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
-			cfg, err := config.LoadConfig(configFile, clusterName)
+			nameExplicit := cmd.Flags().Changed("name")
+			cfg, err := config.LoadConfig(configFile, clusterName, nameExplicit)
 			if err != nil {
 				return err
 			}
@@ -129,7 +133,62 @@ func main() {
 			return nil
 		},
 	}
-	getCmd.AddCommand(getClustersCmd, getNodesCmd)
+
+	getKubeconfigCmd := &cobra.Command{
+		Use:   "kubeconfig",
+		Short: "Prints the kubeconfig for a cluster to stdout",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			mgr, err := cluster.NewManager()
+			if err != nil {
+				return err
+			}
+			kubeconfigPath := filepath.Join(mgr.ClusterDir(clusterName), "kubeconfig")
+			data, err := os.ReadFile(kubeconfigPath)
+			if err != nil {
+				return fmt.Errorf("read kubeconfig for cluster %q: %w", clusterName, err)
+			}
+			fmt.Print(string(data))
+			return nil
+		},
+	}
+	getCmd.AddCommand(getClustersCmd, getNodesCmd, getKubeconfigCmd)
+
+	// 4. 'export' command group
+	exportCmd := &cobra.Command{
+		Use:   "export",
+		Short: "Exports cluster resources",
+	}
+
+	exportKubeconfigCmd := &cobra.Command{
+		Use:   "kubeconfig",
+		Short: "Exports cluster kubeconfig to a specified file or ~/.kube/config",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			mgr, err := cluster.NewManager()
+			if err != nil {
+				return err
+			}
+			srcPath := filepath.Join(mgr.ClusterDir(clusterName), "kubeconfig")
+			data, err := os.ReadFile(srcPath)
+			if err != nil {
+				return fmt.Errorf("read kubeconfig for cluster %q: %w", clusterName, err)
+			}
+			targetPath := exportKubeconfigPath
+			if targetPath == "" {
+				home, _ := os.UserHomeDir()
+				targetPath = filepath.Join(home, ".kube", "config")
+			}
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+				return fmt.Errorf("create kube dir: %w", err)
+			}
+			if err := os.WriteFile(targetPath, data, 0600); err != nil {
+				return fmt.Errorf("write kubeconfig to %s: %w", targetPath, err)
+			}
+			fmt.Printf("Kubeconfig exported to %s\n", targetPath)
+			return nil
+		},
+	}
+	exportKubeconfigCmd.Flags().StringVar(&exportKubeconfigPath, "kubeconfig", "", "Path to export kubeconfig (defaults to ~/.kube/config)")
+	exportCmd.AddCommand(exportKubeconfigCmd)
 
 	// 4. 'load' command group
 	loadCmd := &cobra.Command{
@@ -213,7 +272,7 @@ func main() {
 		},
 	}
 
-	rootCmd.AddCommand(createCmd, deleteCmd, getCmd, loadCmd, buildCmd, execCmd)
+	rootCmd.AddCommand(createCmd, deleteCmd, getCmd, exportCmd, loadCmd, buildCmd, execCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

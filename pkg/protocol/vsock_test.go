@@ -81,3 +81,45 @@ func TestSendRequestAndResponse(t *testing.T) {
 		t.Fatalf("unexpected stdout: %s", string(execResp.Stdout))
 	}
 }
+
+func TestWriteFileRequestSerialization(t *testing.T) {
+	req := WriteFileRequest{
+		Path:        "/etc/test.conf",
+		Content:     []byte("test=true"),
+		Permissions: 0644,
+		Append:      true,
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+
+	var parsed WriteFileRequest
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+
+	if !parsed.Append {
+		t.Fatalf("expected Append true, got %v", parsed.Append)
+	}
+	if parsed.Path != req.Path {
+		t.Fatalf("expected path %s, got %s", req.Path, parsed.Path)
+	}
+}
+
+func TestMaxFrameSizeExceeded(t *testing.T) {
+	buf := new(bytes.Buffer)
+	// Write a length prefix exceeding MaxFrameSize
+	excessLength := uint32(MaxFrameSize + 1)
+	buf.WriteByte(byte(excessLength >> 24))
+	buf.WriteByte(byte(excessLength >> 16))
+	buf.WriteByte(byte(excessLength >> 8))
+	buf.WriteByte(byte(excessLength))
+
+	fr := NewFrameReader(buf)
+	_, err := fr.ReadFrame()
+	if err == nil {
+		t.Fatalf("expected error for frame exceeding MaxFrameSize, got nil")
+	}
+}

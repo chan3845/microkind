@@ -10,6 +10,9 @@ import (
 // DefaultVsockPort is the guest vsock port where fckind-agent listens.
 const DefaultVsockPort = 1024
 
+// MaxFrameSize is the sanity limit for a single framed message (256 MB)
+const MaxFrameSize = 256 * 1024 * 1024
+
 // Operation types for vsock RPC
 const (
 	OpPing            = "ping"
@@ -61,6 +64,7 @@ type WriteFileRequest struct {
 	Path        string `json:"path"`
 	Content     []byte `json:"content"`
 	Permissions uint32 `json:"permissions"` // e.g. 0644
+	Append      bool   `json:"append,omitempty"`
 }
 
 // WriteFileResponse payload for OpWriteFile
@@ -117,8 +121,8 @@ func (fr *FrameReader) ReadFrame() ([]byte, error) {
 	if err := binary.Read(fr.r, binary.BigEndian, &length); err != nil {
 		return nil, err
 	}
-	if length > 64*1024*1024 { // 64 MB frame limit for sanity
-		return nil, fmt.Errorf("frame size exceeds maximum limit (%d bytes)", length)
+	if length > MaxFrameSize {
+		return nil, fmt.Errorf("frame size exceeds maximum limit (%d bytes, max %d)", length, MaxFrameSize)
 	}
 	buf := make([]byte, length)
 	if _, err := io.ReadFull(fr.r, buf); err != nil {

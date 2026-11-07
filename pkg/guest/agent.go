@@ -57,6 +57,16 @@ func RunAgent() error {
 }
 
 func handleVsockConn(nfd int, from unix.Sockaddr) {
+	// Security: Only allow connections originating from the host (CID 2).
+	// Reject connections from other microVM CIDs or internal loopback containers.
+	if sa, ok := from.(*unix.SockaddrVM); ok {
+		if sa.CID != unix.VMADDR_CID_HOST {
+			log.Printf("[fckind-agent] Blocked unauthorized vsock connection from CID %d (expected host CID %d)", sa.CID, unix.VMADDR_CID_HOST)
+			_ = unix.Close(nfd)
+			return
+		}
+	}
+
 	connFile := os.NewFile(uintptr(nfd), "vsock-client")
 	defer connFile.Close()
 
@@ -190,12 +200,27 @@ func handleWriteFile(w io.Writer, payload []byte) {
 		perm = 0644
 	}
 
-	if err := os.WriteFile(req.Path, req.Content, perm); err != nil {
-		_ = protocol.SendResponse(w, false, fmt.Sprintf("write file failed: %v", err), nil)
+	flags := os.O_CREATE | os.O_WRONLY
+	if req.Append {
+		flags |= os.O_APPEND
+	} else {
+		flags |= os.O_TRUNC
+	}
+
+	f, err := os.OpenFile(req.Path, flags, perm)
+	if err != nil {
+		_ = protocol.SendResponse(w, false, fmt.Sprintf("open file %s failed: %v", req.Path, err), nil)
+		return
+	}
+	defer f.Close()
+
+	n, err := f.Write(req.Content)
+	if err != nil {
+		_ = protocol.SendResponse(w, false, fmt.Sprintf("write to %s failed: %v", req.Path, err), nil)
 		return
 	}
 
-	_ = protocol.SendResponse(w, true, "", protocol.WriteFileResponse{BytesWritten: len(req.Content)})
+	_ = protocol.SendResponse(w, true, "", protocol.WriteFileResponse{BytesWritten: n})
 }
 
 func handleReadFile(w io.Writer, payload []byte) {
@@ -248,13 +273,13 @@ func handleConfigureRoutes(w io.Writer, payload []byte) {
 }
 
 func handleLoadImage(w io.Writer, payload []byte) {
-	// Import image tar stream directly into containerd
-	cmd := exec.Command("ctr", "-n", "k8s.io", "images", "import", "-")
+	// Import image tar stream directly into containerd via k0s
+	cmd := exec.Command("k0s", "ctr", "images", "import", "-")
 	cmd.Stdin = bytes.NewReader(payload)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		_ = protocol.SendResponse(w, false, fmt.Sprintf("ctr images import failed: %v (%s)", err, string(out)), nil)
+		_ = protocol.SendResponse(w, false, fmt.Sprintf("k0s ctr images import failed: %v (%s)", err, string(out)), nil)
 		return
 	}
 

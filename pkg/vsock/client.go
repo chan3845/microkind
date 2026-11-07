@@ -31,6 +31,10 @@ func (c *Client) dial(ctx context.Context) (net.Conn, error) {
 		return nil, fmt.Errorf("dial vsock unix socket %s: %w", c.udsPath, err)
 	}
 
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+
 	// Handshake with Firecracker vsock multiplexer
 	connectMsg := fmt.Sprintf("CONNECT %d\n", protocol.DefaultVsockPort)
 	if _, err := conn.Write([]byte(connectMsg)); err != nil {
@@ -152,17 +156,58 @@ func (c *Client) Exec(ctx context.Context, cmd []string, env map[string]string, 
 
 // WriteFile writes file content to the specified guest path
 func (c *Client) WriteFile(ctx context.Context, path string, content []byte, perm uint32) error {
+	return c.writeFileInternal(ctx, protocol.WriteFileRequest{
+		Path:        path,
+		Content:     content,
+		Permissions: perm,
+		Append:      false,
+	})
+}
+
+// WriteFileChunked streams an io.Reader to a guest path in chunks (e.g. 4MB) to prevent guest/host OOM
+func (c *Client) WriteFileChunked(ctx context.Context, path string, r io.Reader, perm uint32, chunkSize int) error {
+	if chunkSize <= 0 {
+		chunkSize = 4 * 1024 * 1024 // 4 MB chunk default
+	}
+	buf := make([]byte, chunkSize)
+	first := true
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		n, err := io.ReadFull(r, buf)
+		if n > 0 {
+			req := protocol.WriteFileRequest{
+				Path:        path,
+				Content:     buf[:n],
+				Permissions: perm,
+				Append:      !first,
+			}
+			if err := c.writeFileInternal(ctx, req); err != nil {
+				return err
+			}
+			first = false
+		}
+		if err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
+			return fmt.Errorf("read stream: %w", err)
+		}
+	}
+	return nil
+}
+
+func (c *Client) writeFileInternal(ctx context.Context, req protocol.WriteFileRequest) error {
 	conn, err := c.dial(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-
-	req := protocol.WriteFileRequest{
-		Path:        path,
-		Content:     content,
-		Permissions: perm,
-	}
 
 	if err := protocol.SendRequest(conn, protocol.OpWriteFile, req); err != nil {
 		return fmt.Errorf("send write_file: %w", err)

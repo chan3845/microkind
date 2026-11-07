@@ -36,12 +36,12 @@ type InstanceConfig struct {
 
 // Instance manages the lifecycle and REST client for a single Firecracker microVM
 type Instance struct {
-	Config   InstanceConfig
-	Cmd      *exec.Cmd
-	APISock  string
-	HTTPCli  *http.Client
-	Stdout   *os.File
-	Stderr   *os.File
+	Config  InstanceConfig
+	Cmd     *exec.Cmd
+	APISock string
+	HTTPCli *http.Client
+	Stdout  *os.File
+	Stderr  *os.File
 }
 
 // NewInstance creates a new microVM instance definition
@@ -95,7 +95,11 @@ func (inst *Instance) Start(ctx context.Context) error {
 		logFile.Close()
 		return fmt.Errorf("start firecracker binary: %w", err)
 	}
+	logFile.Close() // Safe to close in parent; child process retains open file descriptor
 	inst.Cmd = cmd
+
+	pidPath := filepath.Join(inst.Config.SocketDir, "firecracker.pid")
+	_ = os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", cmd.Process.Pid)), 0644)
 
 	// 2. Wait for API socket to be created and respond
 	if err := inst.waitForAPISocket(ctx, 3*time.Second); err != nil {
@@ -210,6 +214,19 @@ func (inst *Instance) Resume(ctx context.Context) error {
 	return inst.put(ctx, "/actions", map[string]any{"action_type": "Resume"})
 }
 
+// PID returns the OS process ID of the running Firecracker instance
+func (inst *Instance) PID() int {
+	if inst.Cmd != nil && inst.Cmd.Process != nil {
+		return inst.Cmd.Process.Pid
+	}
+	return 0
+}
+
+// Shutdown sends an ACPI SendCtrlAltDel to the microVM for graceful shutdown
+func (inst *Instance) Shutdown(ctx context.Context) error {
+	return inst.put(ctx, "/actions", map[string]any{"action_type": "SendCtrlAltDel"})
+}
+
 // Kill terminates the microVM process and removes temporary sockets
 func (inst *Instance) Kill() {
 	if inst.Cmd != nil && inst.Cmd.Process != nil {
@@ -218,6 +235,7 @@ func (inst *Instance) Kill() {
 	}
 	_ = os.Remove(inst.APISock)
 	_ = os.Remove(inst.Config.VsockPath)
+	_ = os.Remove(filepath.Join(inst.Config.SocketDir, "firecracker.pid"))
 }
 
 func (inst *Instance) waitForAPISocket(ctx context.Context, timeout time.Duration) error {
