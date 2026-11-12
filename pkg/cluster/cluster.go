@@ -234,6 +234,38 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 	fmt.Printf("Initializing Kubernetes control-plane on %s...\n", cpNode.Name)
 	cpCli := vsock.NewClient(cpNode.VsockPath)
 
+	// Format k0s CNI & network configuration
+	cniProvider := strings.ToLower(cfg.Networking.CNI.Provider)
+	isCustomCNI := cniProvider == "none" || cniProvider == "custom" || cniProvider == "disabled" || cniProvider == "false"
+	if isCustomCNI {
+		cniProvider = "custom"
+	} else if cniProvider == "kube-router" || cniProvider == "kuberouter" {
+		cniProvider = "kuberouter"
+	}
+
+	storageType := cfg.K0s.Storage.Type
+	if storageType == "" {
+		storageType = "kine"
+	}
+
+	k0sConfigYaml := fmt.Sprintf(`apiVersion: k0s.k0sproject.io/v1beta1
+kind: ClusterConfig
+metadata:
+  name: %s
+spec:
+  api:
+    address: %s
+    port: 6443
+  network:
+    provider: %s
+    podCIDR: %s
+    serviceCIDR: %s
+  storage:
+    type: %s
+`, cfg.Name, cpNode.GuestIP, cniProvider, cfg.Networking.PodSubnet, cfg.Networking.ServiceSubnet, storageType)
+
+	_ = cpCli.WriteFile(ctx, "/etc/k0s/k0s.yaml", []byte(k0sConfigYaml), 0644)
+
 	hasWorkers := false
 	for _, n := range cfg.Nodes {
 		if n.Role == config.RoleWorker {
@@ -242,7 +274,7 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 		}
 	}
 
-	installCmd := []string{"k0s", "install", "controller", "--enable-worker", "--ignore-pre-flight-checks", "--force", "--start"}
+	installCmd := []string{"k0s", "install", "controller", "--enable-worker", "--ignore-pre-flight-checks", "--force", "--start", "-c", "/etc/k0s/k0s.yaml"}
 	if !hasWorkers {
 		installCmd = append(installCmd, "--no-taints")
 	}
@@ -349,11 +381,21 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 		resp, err := cpCli.Exec(ctx, []string{"k0s", "kubectl", "get", "nodes", "--no-headers"}, nil, "", nil)
 		if err == nil && resp.ExitCode == 0 {
 			lines := strings.Split(strings.TrimSpace(string(resp.Stdout)), "\n")
+			validLines := 0
 			readyCount := 0
 			for _, line := range lines {
-				if strings.Contains(line, "Ready") && !strings.Contains(line, "NotReady") {
-					readyCount++
+				trimmed := strings.TrimSpace(line)
+				if trimmed != "" {
+					validLines++
+					if strings.Contains(trimmed, "Ready") && !strings.Contains(trimmed, "NotReady") {
+						readyCount++
+					}
 				}
+			}
+			if isCustomCNI && validLines >= len(state.Nodes) {
+				fmt.Printf("All %d nodes registered with API server (status: NotReady pending CNI installation).\n", validLines)
+				allReady = true
+				break
 			}
 			if readyCount >= len(state.Nodes) {
 				allReady = true

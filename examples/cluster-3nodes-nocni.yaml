@@ -1,0 +1,32 @@
+# microkind 3-node cluster configuration with disabled default CNI
+kind: Cluster
+apiVersion: fckind.io/v1alpha1
+name: k8s-lab
+
+networking:
+  podSubnet: "10.244.0.0/16"       # Pod IP CIDR
+  serviceSubnet: "10.96.0.0/12"     # Service IP CIDR
+  cni:
+    provider: none                 # "none" / "custom" disables built-in kube-router so you can install Cilium, Calico, etc.
+  apiServerPort: 6443              # Optional host port forward to Kubernetes API
+
+k0s:
+  version: "v1.37.2+k0s.0"
+  storage:
+    type: "kine"                   # "kine" (embedded SQLite) or "etcd" (HA)
+
+nodes:
+  - role: control-plane
+    vcpus: 2
+    memoryMiB: 1024
+    diskSizeGiB: 20
+
+  - role: worker
+    vcpus: 2
+    memoryMiB: 1024
+    diskSizeGiB: 20
+
+  - role: worker
+    vcpus: 2
+    memoryMiB: 1024
+    diskSizeGiB: 20
