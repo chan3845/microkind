@@ -142,33 +142,12 @@ func (b *Builder) ExtractRootfs(ctx context.Context, imageTag string, targetDir 
 		return fmt.Errorf("mount rootfs staging: %w (%s)", err, string(out))
 	}
 
-	// Export container tarball directly into staging mount
-	exportCmd := exec.CommandContext(ctx, "docker", "export", containerID)
-	tarCmd := exec.CommandContext(ctx, "sudo", "tar", "-C", stagingMount, "-xf", "-")
-
-	pipe, err := exportCmd.StdoutPipe()
-	if err != nil {
+	// Export container tarball directly into staging mount using robust shell pipeline
+	pipeCmd := fmt.Sprintf("docker export %s | sudo tar -C %s -xf -", containerID, stagingMount)
+	unpackCmd := exec.CommandContext(ctx, "sh", "-c", pipeCmd)
+	if out, err := unpackCmd.CombinedOutput(); err != nil {
 		_ = exec.Command("sudo", "umount", stagingMount).Run()
-		return fmt.Errorf("export pipe: %w", err)
-	}
-	tarCmd.Stdin = pipe
-
-	if err := exportCmd.Start(); err != nil {
-		_ = exec.Command("sudo", "umount", stagingMount).Run()
-		return fmt.Errorf("start docker export: %w", err)
-	}
-	if err := tarCmd.Start(); err != nil {
-		_ = exec.Command("sudo", "umount", stagingMount).Run()
-		return fmt.Errorf("start tar unpack: %w", err)
-	}
-
-	if err := exportCmd.Wait(); err != nil {
-		_ = exec.Command("sudo", "umount", stagingMount).Run()
-		return fmt.Errorf("wait docker export: %w", err)
-	}
-	if err := tarCmd.Wait(); err != nil {
-		_ = exec.Command("sudo", "umount", stagingMount).Run()
-		return fmt.Errorf("wait tar unpack: %w", err)
+		return fmt.Errorf("unpack container rootfs: %w (%s)", err, string(out))
 	}
 
 	// Sync and unmount
