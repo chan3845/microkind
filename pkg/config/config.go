@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -28,17 +29,59 @@ type ClusterConfig struct {
 	Kind       string           `yaml:"kind"`
 	APIVersion string           `yaml:"apiVersion"`
 	Name       string           `yaml:"name"`
+	Spec       *SpecConfig      `yaml:"spec,omitempty"`
 	Networking NetworkingConfig `yaml:"networking"`
 	K0s        K0sConfig        `yaml:"k0s"`
 	Nodes      []NodeConfig     `yaml:"nodes"`
 }
 
+// SpecConfig defines optional Kubernetes-style spec settings
+type SpecConfig struct {
+	Network *SpecNetworkConfig `yaml:"network,omitempty"`
+}
+
+// SpecNetworkConfig defines network settings under spec
+type SpecNetworkConfig struct {
+	KubeProxy *KubeProxyConfig `yaml:"kubeProxy,omitempty"`
+}
+
 // NetworkingConfig defines cluster networking options
 type NetworkingConfig struct {
-	PodSubnet     string    `yaml:"podSubnet"`
-	ServiceSubnet string    `yaml:"serviceSubnet"`
-	CNI           CNIConfig `yaml:"cni"`
-	APIServerPort int       `yaml:"apiServerPort,omitempty"`
+	PodSubnet     string          `yaml:"podSubnet"`
+	ServiceSubnet string          `yaml:"serviceSubnet"`
+	CNI           CNIConfig       `yaml:"cni"`
+	KubeProxy     KubeProxyConfig `yaml:"kubeProxy,omitempty"`
+	APIServerPort int             `yaml:"apiServerPort,omitempty"`
+}
+
+// KubeProxyConfig defines cluster kube-proxy options
+type KubeProxyConfig struct {
+	Disabled bool   `yaml:"disabled"`
+	Mode     string `yaml:"mode,omitempty"`
+}
+
+// UnmarshalYAML supports both mapping format (disabled: true) and scalar string (disabled / none / off)
+func (k *KubeProxyConfig) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		val := strings.ToLower(strings.TrimSpace(value.Value))
+		if val == "disabled" || val == "none" || val == "false" || val == "off" {
+			k.Disabled = true
+			return nil
+		}
+		if val == "enabled" || val == "true" || val == "on" {
+			k.Disabled = false
+			return nil
+		}
+		k.Mode = val
+		return nil
+	}
+	type rawKubeProxy KubeProxyConfig
+	var raw rawKubeProxy
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	*k = KubeProxyConfig(raw)
+	return nil
 }
 
 // CNIConfig defines the CNI provider
@@ -143,6 +186,15 @@ func LoadConfig(path string, clusterName string, nameExplicit bool) (*ClusterCon
 }
 
 func (c *ClusterConfig) applyDefaults() {
+	if c.Spec != nil && c.Spec.Network != nil && c.Spec.Network.KubeProxy != nil {
+		if !c.Networking.KubeProxy.Disabled && c.Spec.Network.KubeProxy.Disabled {
+			c.Networking.KubeProxy.Disabled = true
+		}
+		if c.Networking.KubeProxy.Mode == "" && c.Spec.Network.KubeProxy.Mode != "" {
+			c.Networking.KubeProxy.Mode = c.Spec.Network.KubeProxy.Mode
+		}
+	}
+
 	if c.Kind == "" {
 		c.Kind = "Cluster"
 	}

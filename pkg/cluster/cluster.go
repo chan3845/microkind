@@ -248,6 +248,13 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 		storageType = "kine"
 	}
 
+	kubeProxySection := ""
+	if cfg.Networking.KubeProxy.Disabled {
+		kubeProxySection = `
+    kubeProxy:
+      disabled: true`
+	}
+
 	k0sConfigYaml := fmt.Sprintf(`apiVersion: k0s.k0sproject.io/v1beta1
 kind: ClusterConfig
 metadata:
@@ -259,10 +266,10 @@ spec:
   network:
     provider: %s
     podCIDR: %s
-    serviceCIDR: %s
+    serviceCIDR: %s%s
   storage:
     type: %s
-`, cfg.Name, cpNode.GuestIP, cniProvider, cfg.Networking.PodSubnet, cfg.Networking.ServiceSubnet, storageType)
+`, cfg.Name, cpNode.GuestIP, cniProvider, cfg.Networking.PodSubnet, cfg.Networking.ServiceSubnet, kubeProxySection, storageType)
 
 	_ = cpCli.WriteFile(ctx, "/etc/k0s/k0s.yaml", []byte(k0sConfigYaml), 0644)
 

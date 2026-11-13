@@ -77,3 +77,73 @@ nodes:
 		t.Fatalf("expected cluster name override 'my-override', got %s", cfgOverride.Name)
 	}
 }
+
+func TestKubeProxyConfiguration(t *testing.T) {
+	tests := []struct {
+		name             string
+		yaml             string
+		expectedDisabled bool
+	}{
+		{
+			name: "networking.kubeProxy.disabled boolean true",
+			yaml: `
+name: test-kp-1
+networking:
+  kubeProxy:
+    disabled: true
+nodes:
+  - role: control-plane
+`,
+			expectedDisabled: true,
+		},
+		{
+			name: "networking.kubeProxy scalar disabled",
+			yaml: `
+name: test-kp-2
+networking:
+  kubeProxy: disabled
+nodes:
+  - role: control-plane
+`,
+			expectedDisabled: true,
+		},
+		{
+			name: "spec.network.kubeProxy scalar disabled",
+			yaml: `
+name: test-kp-3
+spec:
+  network:
+    kubeProxy: disabled
+nodes:
+  - role: control-plane
+`,
+			expectedDisabled: true,
+		},
+		{
+			name: "default kubeProxy is not disabled",
+			yaml: `
+name: test-kp-4
+nodes:
+  - role: control-plane
+`,
+			expectedDisabled: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			path := filepath.Join(tmpDir, "cluster.yaml")
+			if err := os.WriteFile(path, []byte(tc.yaml), 0644); err != nil {
+				t.Fatalf("write temp yaml: %v", err)
+			}
+			cfg, err := LoadConfig(path, "", false)
+			if err != nil {
+				t.Fatalf("LoadConfig error: %v", err)
+			}
+			if cfg.Networking.KubeProxy.Disabled != tc.expectedDisabled {
+				t.Fatalf("expected KubeProxy.Disabled=%v, got %v", tc.expectedDisabled, cfg.Networking.KubeProxy.Disabled)
+			}
+		})
+	}
+}

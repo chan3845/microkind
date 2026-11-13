@@ -1,4 +1,4 @@
-# microkind 3-node cluster configuration with disabled default CNI
+# microkind 3-node cluster configuration with disabled default CNI and kube-proxy
 kind: Cluster
 apiVersion: fckind.io/v1alpha1
 name: k8s-lab
@@ -8,6 +8,8 @@ networking:
   serviceSubnet: "10.96.0.0/12"     # Service IP CIDR
   cni:
     provider: none                 # "none" / "custom" disables built-in kube-router so you can install Cilium, Calico, etc.
+  kubeProxy:
+    disabled: true                 # disables built-in kube-proxy for Cilium/eBPF kube-proxy replacement
   apiServerPort: 6443              # Optional host port forward to Kubernetes API
 
 k0s:
