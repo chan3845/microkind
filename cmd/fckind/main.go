@@ -272,7 +272,87 @@ func main() {
 		},
 	}
 
-	rootCmd.AddCommand(createCmd, deleteCmd, getCmd, exportCmd, loadCmd, buildCmd, execCmd)
+	// 7. 'stop' command group
+	stopCmd := &cobra.Command{
+		Use:   "stop",
+		Short: "Stops one of [cluster]",
+	}
+
+	stopClusterCmd := &cobra.Command{
+		Use:   "cluster",
+		Short: "Stops a cluster's microVMs while preserving disk and Kubernetes state",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			mgr, err := cluster.NewManager()
+			if err != nil {
+				return err
+			}
+			return mgr.StopCluster(ctx, clusterName)
+		},
+	}
+	stopCmd.AddCommand(stopClusterCmd)
+
+	// 8. 'start' command group
+	startCmd := &cobra.Command{
+		Use:   "start",
+		Short: "Starts one of [cluster]",
+	}
+
+	startClusterCmd := &cobra.Command{
+		Use:   "cluster",
+		Short: "Starts a previously stopped cluster with its preserved state",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			mgr, err := cluster.NewManager()
+			if err != nil {
+				return err
+			}
+			return mgr.StartCluster(ctx, clusterName)
+		},
+	}
+	startCmd.AddCommand(startClusterCmd)
+
+	// 9. 'pause' command group
+	pauseCmd := &cobra.Command{
+		Use:   "pause",
+		Short: "Pauses one of [cluster]",
+	}
+
+	pauseClusterCmd := &cobra.Command{
+		Use:   "cluster",
+		Short: "Pauses all microVM vCPUs in a cluster (frees CPU, retains RAM)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			mgr, err := cluster.NewManager()
+			if err != nil {
+				return err
+			}
+			return mgr.PauseCluster(ctx, clusterName)
+		},
+	}
+	pauseCmd.AddCommand(pauseClusterCmd)
+
+	// 10. 'resume' command group
+	resumeCmd := &cobra.Command{
+		Use:   "resume",
+		Short: "Resumes one of [cluster]",
+	}
+
+	resumeClusterCmd := &cobra.Command{
+		Use:   "cluster",
+		Short: "Resumes all paused microVM vCPUs in a cluster",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			mgr, err := cluster.NewManager()
+			if err != nil {
+				return err
+			}
+			return mgr.ResumeCluster(ctx, clusterName)
+		},
+	}
+	resumeCmd.AddCommand(resumeClusterCmd)
+
+	rootCmd.AddCommand(createCmd, deleteCmd, stopCmd, startCmd, pauseCmd, resumeCmd, getCmd, exportCmd, loadCmd, buildCmd, execCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

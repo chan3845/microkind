@@ -204,14 +204,53 @@ func (inst *Instance) Start(ctx context.Context) error {
 	return nil
 }
 
-// Pause pauses the microVM vCPUs
+// Pause pauses the microVM vCPUs via Firecracker PATCH /vm
 func (inst *Instance) Pause(ctx context.Context) error {
-	return inst.put(ctx, "/actions", map[string]any{"action_type": "Pause"})
+	return inst.patch(ctx, "/vm", map[string]any{"state": "Paused"})
 }
 
-// Resume resumes the microVM vCPUs
+// Resume resumes the microVM vCPUs via Firecracker PATCH /vm
 func (inst *Instance) Resume(ctx context.Context) error {
-	return inst.put(ctx, "/actions", map[string]any{"action_type": "Resume"})
+	return inst.patch(ctx, "/vm", map[string]any{"state": "Resumed"})
+}
+
+// SetVMState sends PATCH /vm with the given state ("Paused" or "Resumed") to a Firecracker API socket
+func SetVMState(ctx context.Context, apiSock string, state string) error {
+	if apiSock == "" {
+		return fmt.Errorf("empty api socket path")
+	}
+	if _, err := os.Stat(apiSock); err != nil {
+		return fmt.Errorf("api socket %s not found: %w", apiSock, err)
+	}
+	cli := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", apiSock)
+			},
+		},
+		Timeout: 5 * time.Second,
+	}
+	data, err := json.Marshal(map[string]any{"state": state})
+	if err != nil {
+		return fmt.Errorf("marshal patch body: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, "http://localhost/vm", bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("create patch request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := cli.Do(req)
+	if err != nil {
+		return fmt.Errorf("do patch request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("api error (%d %s): %s", resp.StatusCode, resp.Status, string(respBody))
+	}
+	return nil
 }
 
 // PID returns the OS process ID of the running Firecracker instance
@@ -261,20 +300,28 @@ func (inst *Instance) waitForAPISocket(ctx context.Context, timeout time.Duratio
 }
 
 func (inst *Instance) put(ctx context.Context, path string, body any) error {
+	return inst.doJSON(ctx, http.MethodPut, path, body)
+}
+
+func (inst *Instance) patch(ctx context.Context, path string, body any) error {
+	return inst.doJSON(ctx, http.MethodPatch, path, body)
+}
+
+func (inst *Instance) doJSON(ctx context.Context, method string, path string, body any) error {
 	data, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("marshal put body: %w", err)
+		return fmt.Errorf("marshal %s body: %w", method, err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://localhost"+path, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, method, "http://localhost"+path, bytes.NewReader(data))
 	if err != nil {
-		return fmt.Errorf("create put request: %w", err)
+		return fmt.Errorf("create %s request: %w", method, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := inst.HTTPCli.Do(req)
 	if err != nil {
-		return fmt.Errorf("do put request: %w", err)
+		return fmt.Errorf("do %s request: %w", method, err)
 	}
 	defer resp.Body.Close()
 

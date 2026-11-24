@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ import (
 // ClusterState holds the persistent metadata for a provisioned cluster
 type ClusterState struct {
 	Config     config.ClusterConfig `json:"config"`
+	Status     string               `json:"status,omitempty"`
 	BridgeName string               `json:"bridge_name"`
 	GatewayIP  string               `json:"gateway_ip"`
 	SubnetCIDR string               `json:"subnet_cidr"`
@@ -43,6 +45,8 @@ type NodeState struct {
 	VsockPath   string          `json:"vsock_path"`
 	APISockPath string          `json:"api_sock_path"`
 	StateDir    string          `json:"state_dir"`
+	VCPUs       int             `json:"vcpus,omitempty"`
+	MemoryMiB   int             `json:"memory_mib,omitempty"`
 	PID         int             `json:"pid,omitempty"`
 }
 
@@ -122,6 +126,7 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 
 	state := &ClusterState{
 		Config:     *cfg,
+		Status:     "running",
 		BridgeName: netMgr.BridgeName,
 		GatewayIP:  netMgr.GatewayIP.String(),
 		SubnetCIDR: netMgr.Subnet.String(),
@@ -194,6 +199,8 @@ func (m *Manager) CreateCluster(ctx context.Context, cfg *config.ClusterConfig) 
 			VsockPath:   inst.Config.VsockPath,
 			APISockPath: inst.APISock,
 			StateDir:    nodeDir,
+			VCPUs:       nodeCfg.VCPUs,
+			MemoryMiB:   nodeCfg.MemoryMiB,
 			PID:         inst.PID(),
 		}
 		state.Nodes[nodeName] = nodeState
@@ -449,7 +456,7 @@ func (m *Manager) DeleteCluster(ctx context.Context, name string) error {
 	}
 
 	// 2. Clean up network & port forward
-	netMgr, err := network.NewNetworkManager(name)
+	netMgr, err := network.NewNetworkManagerFromState(name, state.BridgeName, state.SubnetCIDR, state.GatewayIP)
 	if err == nil {
 		if state.Config.Networking.APIServerPort > 0 {
 			for _, n := range state.Nodes {
@@ -471,6 +478,362 @@ func (m *Manager) DeleteCluster(ctx context.Context, name string) error {
 
 	fmt.Printf("Cluster %q deleted successfully.\n", name)
 	return nil
+}
+
+// StopCluster gracefully shuts down all microVMs and host networking while preserving disk state (overlay.ext4, kubeconfig, state.json)
+func (m *Manager) StopCluster(ctx context.Context, name string) error {
+	state, err := m.GetCluster(name)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Stopping cluster %q (preserving disk & Kubernetes state)...\n", name)
+
+	// 1. Best-effort graceful k0s stop & filesystem sync inside each running guest
+	var wg sync.WaitGroup
+	for _, n := range state.Nodes {
+		if n.PID > 0 && isProcessAlive(n.PID) && n.VsockPath != "" {
+			wg.Add(1)
+			go func(node NodeState) {
+				defer wg.Done()
+				stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				cli := vsock.NewClient(node.VsockPath)
+				if node.Role == config.RoleControlPlane {
+					_, _ = cli.Exec(stopCtx, []string{"rc-service", "k0scontroller", "stop"}, nil, "", nil)
+				} else {
+					_, _ = cli.Exec(stopCtx, []string{"rc-service", "k0sworker", "stop"}, nil, "", nil)
+				}
+				_, _ = cli.Exec(stopCtx, []string{"sync"}, nil, "", nil)
+			}(n)
+		}
+	}
+	wg.Wait()
+
+	// 2. Shut down all Firecracker microVMs
+	for nodeName, n := range state.Nodes {
+		m.terminateNode(ctx, n)
+		n.PID = 0
+		state.Nodes[nodeName] = n
+	}
+
+	// 3. Tear down port forward, TAPs, and bridge so host ports & interfaces are freed
+	netMgr, err := network.NewNetworkManagerFromState(name, state.BridgeName, state.SubnetCIDR, state.GatewayIP)
+	if err == nil {
+		if state.Config.Networking.APIServerPort > 0 {
+			for _, n := range state.Nodes {
+				if n.Role == config.RoleControlPlane {
+					netMgr.TeardownPortForward(state.Config.Networking.APIServerPort, n.GuestIP)
+					break
+				}
+			}
+		}
+		var tapNames []string
+		for _, n := range state.Nodes {
+			tapNames = append(tapNames, n.TAPName)
+		}
+		_ = netMgr.Teardown(tapNames)
+	}
+
+	state.Status = "stopped"
+	if err := m.saveState(name, state); err != nil {
+		return fmt.Errorf("save stopped cluster state: %w", err)
+	}
+
+	fmt.Printf("Cluster %q stopped. All disk state preserved.\n", name)
+	fmt.Printf("To start it again:\n  microkind start cluster -n %s\n", name)
+	return nil
+}
+
+// StartCluster boots a previously stopped cluster using its preserved overlay.ext4 disks and network state
+func (m *Manager) StartCluster(ctx context.Context, name string) error {
+	state, err := m.GetCluster(name)
+	if err != nil {
+		return err
+	}
+
+	// Check if all nodes are already running
+	allAlive := len(state.Nodes) > 0
+	for _, n := range state.Nodes {
+		if n.PID <= 0 || !isProcessAlive(n.PID) {
+			allAlive = false
+			break
+		}
+	}
+	if allAlive {
+		if state.Status == "paused" {
+			return m.ResumeCluster(ctx, name)
+		}
+		fmt.Printf("Cluster %q is already running.\n", name)
+		return nil
+	}
+
+	fmt.Printf("Starting cluster %q with %d nodes...\n", name, len(state.Nodes))
+
+	// 1. Locate cached kernel & read-only base rootfs
+	k0sVer := state.Config.K0s.Version
+	if k0sVer == "" {
+		k0sVer = config.DefaultK0sVersion
+	}
+	builder, err := image.NewBuilder(k0sVer, true)
+	if err != nil {
+		return err
+	}
+	cacheDir := builder.TargetCacheDir()
+	rootfsPath := filepath.Join(cacheDir, "rootfs.ext4")
+	kernelPath := filepath.Join(cacheDir, "vmlinux")
+	if _, err := os.Stat(rootfsPath); err != nil {
+		return fmt.Errorf("base node rootfs not found at %s (run 'microkind build node-image' first): %w", rootfsPath, err)
+	}
+	if _, err := os.Stat(kernelPath); err != nil {
+		return fmt.Errorf("kernel image not found at %s: %w", kernelPath, err)
+	}
+
+	// 2. Recreate host bridge & NAT rules using persisted network settings
+	netMgr, err := network.NewNetworkManagerFromState(name, state.BridgeName, state.SubnetCIDR, state.GatewayIP)
+	if err != nil {
+		return fmt.Errorf("init network manager from state: %w", err)
+	}
+	if err := netMgr.SetupBridge(); err != nil {
+		return fmt.Errorf("setup bridge: %w", err)
+	}
+
+	// Order nodes deterministically: control-plane first, then workers sorted by name
+	orderedNodes := sortedNodeList(state.Nodes)
+
+	var cpNode *NodeState
+	for _, n := range orderedNodes {
+		if n.PID > 0 && isProcessAlive(n.PID) {
+			if n.Role == config.RoleControlPlane && cpNode == nil {
+				cpCopy := n
+				cpNode = &cpCopy
+			}
+			continue
+		}
+
+		overlayPath := filepath.Join(n.StateDir, "overlay.ext4")
+		if _, err := os.Stat(overlayPath); err != nil {
+			return fmt.Errorf("overlay disk missing for node %s at %s: %w", n.Name, overlayPath, err)
+		}
+
+		if err := netMgr.CreateTAP(n.TAPName); err != nil {
+			return fmt.Errorf("create tap for %s: %w", n.Name, err)
+		}
+
+		vcpus, memMiB := resolveNodeResources(state, n)
+		vmmCfg := vmm.InstanceConfig{
+			ID:          n.Name,
+			KernelPath:  kernelPath,
+			RootfsPath:  rootfsPath,
+			OverlayPath: overlayPath,
+			TAPDevName:  n.TAPName,
+			GuestIP:     n.GuestIP,
+			GatewayIP:   state.GatewayIP,
+			Hostname:    n.Name,
+			VCPUs:       vcpus,
+			MemoryMiB:   memMiB,
+			GuestCID:    n.GuestCID,
+			SocketDir:   n.StateDir,
+		}
+
+		inst, err := vmm.NewInstance(vmmCfg)
+		if err != nil {
+			return fmt.Errorf("init vmm instance for %s: %w", n.Name, err)
+		}
+
+		fmt.Printf("Booting microVM for %s (IP: %s, %d vCPUs, %d MiB RAM)...\n", n.Name, n.GuestIP, vcpus, memMiB)
+		if err := inst.Start(ctx); err != nil {
+			return fmt.Errorf("boot microVM %s: %w", n.Name, err)
+		}
+
+		n.PID = inst.PID()
+		n.APISockPath = inst.APISock
+		n.VsockPath = inst.Config.VsockPath
+		n.VCPUs = vcpus
+		n.MemoryMiB = memMiB
+		state.Nodes[n.Name] = n
+
+		if n.Role == config.RoleControlPlane && cpNode == nil {
+			cpCopy := n
+			cpNode = &cpCopy
+		}
+	}
+
+	state.Status = "running"
+	if err := m.saveState(name, state); err != nil {
+		return fmt.Errorf("save started cluster state: %w", err)
+	}
+
+	// 3. Wait for guest agents over vsock
+	fmt.Printf("Waiting for microVM guest agents to respond over virtio-vsock...\n")
+	for _, n := range state.Nodes {
+		cli := vsock.NewClient(n.VsockPath)
+		if err := cli.WaitForReady(ctx, 15*time.Second); err != nil {
+			return fmt.Errorf("node %s agent not ready: %w", n.Name, err)
+		}
+	}
+
+	// 4. Restore optional host port forward for API server
+	if state.Config.Networking.APIServerPort > 0 && cpNode != nil {
+		_ = netMgr.SetupPortForward(state.Config.Networking.APIServerPort, cpNode.GuestIP)
+	}
+
+	// 5. Ensure k0s services are running (control-plane first, then workers)
+	if cpNode != nil {
+		cpCli := vsock.NewClient(cpNode.VsockPath)
+		_, _ = cpCli.Exec(ctx, []string{"rc-service", "k0scontroller", "start"}, nil, "", nil)
+		_, _ = cpCli.Exec(ctx, []string{"k0s", "start"}, nil, "", nil)
+
+		var wg sync.WaitGroup
+		for _, n := range state.Nodes {
+			if n.Role == config.RoleWorker {
+				wg.Add(1)
+				go func(node NodeState) {
+					defer wg.Done()
+					wCli := vsock.NewClient(node.VsockPath)
+					_, _ = wCli.Exec(ctx, []string{"rc-service", "k0sworker", "start"}, nil, "", nil)
+					_, _ = wCli.Exec(ctx, []string{"rc-service", "k0s", "start"}, nil, "", nil)
+					_, _ = wCli.Exec(ctx, []string{"k0s", "start"}, nil, "", nil)
+				}(n)
+			}
+		}
+		wg.Wait()
+
+		// Wait for nodes to report Ready
+		cniProvider := strings.ToLower(state.Config.Networking.CNI.Provider)
+		isCustomCNI := cniProvider == "none" || cniProvider == "custom" || cniProvider == "disabled" || cniProvider == "false"
+
+		fmt.Printf("Waiting for all %d nodes to be Ready in Kubernetes...\n", len(state.Nodes))
+		deadline := time.Now().Add(90 * time.Second)
+		allReady := false
+		for time.Now().Before(deadline) {
+			resp, err := cpCli.Exec(ctx, []string{"k0s", "kubectl", "get", "nodes", "--no-headers"}, nil, "", nil)
+			if err == nil && resp.ExitCode == 0 {
+				lines := strings.Split(strings.TrimSpace(string(resp.Stdout)), "\n")
+				validLines := 0
+				readyCount := 0
+				for _, line := range lines {
+					trimmed := strings.TrimSpace(line)
+					if trimmed != "" {
+						validLines++
+						if strings.Contains(trimmed, "Ready") && !strings.Contains(trimmed, "NotReady") {
+							readyCount++
+						}
+					}
+				}
+				if isCustomCNI && validLines >= len(state.Nodes) {
+					allReady = true
+					break
+				}
+				if readyCount >= len(state.Nodes) {
+					allReady = true
+					break
+				}
+			}
+			time.Sleep(3 * time.Second)
+		}
+		if allReady {
+			fmt.Printf("All nodes are Ready!\n")
+		} else {
+			fmt.Printf("Cluster booted, nodes may still be transitioning to Ready...\n")
+		}
+	}
+
+	kubeconfigPath := filepath.Join(m.ClusterDir(name), "kubeconfig")
+	fmt.Printf("\nCluster %q started successfully!\n", name)
+	fmt.Printf("  export KUBECONFIG=%s\n", kubeconfigPath)
+	return nil
+}
+
+// PauseCluster freezes all running microVM vCPUs via Firecracker PATCH /vm (frees CPU, retains RAM)
+func (m *Manager) PauseCluster(ctx context.Context, name string) error {
+	state, err := m.GetCluster(name)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Pausing cluster %q...\n", name)
+	for _, n := range sortedNodeList(state.Nodes) {
+		if n.PID <= 0 || !isProcessAlive(n.PID) {
+			return fmt.Errorf("node %s is not running (cluster appears stopped)", n.Name)
+		}
+		if err := vmm.SetVMState(ctx, n.APISockPath, "Paused"); err != nil {
+			return fmt.Errorf("pause node %s: %w", n.Name, err)
+		}
+	}
+
+	state.Status = "paused"
+	if err := m.saveState(name, state); err != nil {
+		return fmt.Errorf("save paused cluster state: %w", err)
+	}
+
+	fmt.Printf("Cluster %q paused. Resume with:\n  microkind resume cluster -n %s\n", name, name)
+	return nil
+}
+
+// ResumeCluster unfreezes all paused microVM vCPUs via Firecracker PATCH /vm
+func (m *Manager) ResumeCluster(ctx context.Context, name string) error {
+	state, err := m.GetCluster(name)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Resuming cluster %q...\n", name)
+	for _, n := range sortedNodeList(state.Nodes) {
+		if n.PID <= 0 || !isProcessAlive(n.PID) {
+			return fmt.Errorf("node %s is not running (run 'microkind start cluster -n %s' instead)", n.Name, name)
+		}
+		if err := vmm.SetVMState(ctx, n.APISockPath, "Resumed"); err != nil {
+			return fmt.Errorf("resume node %s: %w", n.Name, err)
+		}
+	}
+
+	state.Status = "running"
+	if err := m.saveState(name, state); err != nil {
+		return fmt.Errorf("save resumed cluster state: %w", err)
+	}
+
+	fmt.Printf("Cluster %q resumed.\n", name)
+	return nil
+}
+
+func sortedNodeList(nodes map[string]NodeState) []NodeState {
+	list := make([]NodeState, 0, len(nodes))
+	for _, n := range nodes {
+		list = append(list, n)
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].Role != list[j].Role {
+			return list[i].Role == config.RoleControlPlane
+		}
+		return list[i].Name < list[j].Name
+	})
+	return list
+}
+
+func resolveNodeResources(state *ClusterState, n NodeState) (vcpus int, memMiB int) {
+	if n.VCPUs > 0 && n.MemoryMiB > 0 {
+		return n.VCPUs, n.MemoryMiB
+	}
+	// Fallback for clusters created before VCPUs/MemoryMiB were stored on NodeState
+	for i, nodeCfg := range state.Config.Nodes {
+		expectedName := fmt.Sprintf("%s-%s-%d", state.Config.Name, nodeCfg.Role, i)
+		if nodeCfg.Role == config.RoleControlPlane && i == 0 {
+			expectedName = fmt.Sprintf("%s-control-plane", state.Config.Name)
+		}
+		if expectedName == n.Name {
+			vcpus = nodeCfg.VCPUs
+			memMiB = nodeCfg.MemoryMiB
+			break
+		}
+	}
+	if vcpus <= 0 {
+		vcpus = 2
+	}
+	if memMiB <= 0 {
+		memMiB = 1024
+	}
+	return vcpus, memMiB
 }
 
 func (m *Manager) terminateNode(ctx context.Context, n NodeState) {

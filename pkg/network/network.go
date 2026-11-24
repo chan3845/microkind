@@ -48,6 +48,28 @@ func NewNetworkManager(clusterName string) (*NetworkManager, error) {
 	}, nil
 }
 
+// NewNetworkManagerFromState reconstructs a NetworkManager using persisted cluster network settings.
+// This ensures stopped clusters restart on the exact same bridge, subnet, and gateway IP.
+func NewNetworkManagerFromState(clusterName, bridgeName, subnetCIDR, gatewayIPStr string) (*NetworkManager, error) {
+	if bridgeName == "" || subnetCIDR == "" || gatewayIPStr == "" {
+		return NewNetworkManager(clusterName)
+	}
+	_, subnet, err := net.ParseCIDR(subnetCIDR)
+	if err != nil {
+		return nil, fmt.Errorf("parse saved subnet %q: %w", subnetCIDR, err)
+	}
+	gatewayIP := net.ParseIP(gatewayIPStr)
+	if gatewayIP == nil {
+		return nil, fmt.Errorf("parse saved gateway IP %q", gatewayIPStr)
+	}
+	return &NetworkManager{
+		ClusterName: clusterName,
+		BridgeName:  bridgeName,
+		Subnet:      subnet,
+		GatewayIP:   gatewayIP,
+	}, nil
+}
+
 func findAvailableSubnet(preferredOctet int) (int, error) {
 	usedOctets := make(map[int]bool)
 	ifaces, err := net.Interfaces()
